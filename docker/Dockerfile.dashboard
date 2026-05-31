@@ -1,28 +1,55 @@
-FROM node:20.19.3-slim
+# syntax=docker/dockerfile:1
+
+# ---------------------------------------------------------------------------
+# Builder stage: install deps and build the dashboard
+# ---------------------------------------------------------------------------
+FROM node:20.19.3-slim AS builder
 
 WORKDIR /app
 
 ENV CI=true
-
 ARG PUBLIC_IS_SELFHOSTED=true
 
 RUN corepack enable && corepack prepare pnpm@10.19.0 --activate
 
-COPY . .
+# Copy only manifests first so the install layer is cached
+# independently of source changes.
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+COPY apps/dashboard/package.json apps/dashboard/
+COPY packages/ packages/
 
 RUN pnpm install --frozen-lockfile --ignore-scripts --filter @cio/dashboard...
-RUN find . -name 'tsconfig.tsbuildinfo' -delete
+
+# Now bring in the rest of the source.
+COPY . .
+
 RUN NODE_OPTIONS="--max-old-space-size=8192" \
     PUBLIC_IS_SELFHOSTED="${PUBLIC_IS_SELFHOSTED}" \
-    pnpm -r --filter @cio/dashboard... build
+    pnpm -r --workspace-concurrency=2 --filter @cio/dashboard... build
 
-RUN test -f apps/dashboard/build/index.js || (echo "ERROR: Dashboard build output not found at apps/dashboard/build/index.js" && exit 1)
+RUN test -f apps/dashboard/build/index.js \
+    || (echo "ERROR: Dashboard build output not found at apps/dashboard/build/index.js" && exit 1)
 
-EXPOSE 3000
+# ---------------------------------------------------------------------------
+# Runtime stage: ship only what's needed to run the server
+# ---------------------------------------------------------------------------
+FROM node:20.19.3-slim AS runner
+
+WORKDIR /app
 
 ENV NODE_ENV=production \
     PORT=3000 \
     PUBLIC_IS_SELFHOSTED=true
 
-WORKDIR /app/apps/dashboard
+# adapter-node output is largely self-contained. Copy the build and the
+# app manifest; uncomment the node_modules line if your adapter config
+# leaves runtime dependencies unbundled.
+COPY --from=builder /app/apps/dashboard/build ./build
+COPY --from=builder /app/apps/dashboard/package.json ./
+# COPY --from=builder /app/apps/dashboard/node_modules ./node_modules
+
+EXPOSE 3000
+
+USER node
+
 CMD ["node", "build/index.js"]
